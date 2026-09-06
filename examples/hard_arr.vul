@@ -1,0 +1,4 @@
+// persisted on disk under .vulcan_hard/
+i32 tape[4] @memory_hard = {1,2,3,4};
+tape[0] = tape[0] + 1;
+print(tape[0]);

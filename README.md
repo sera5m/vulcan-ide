@@ -1,16 +1,15 @@
 # vulcan-ide
 
-Desktop product (Linux / Windows): editor + PC interpreter.
-Like Visual Studio, not like the C# spec.
+Desktop editor + PC interpreter. First run clones [vulcan-lang](https://github.com/sera5m/vulcan-lang).
 
 ```bash
+sudo pacman -S python-gobject gtk4 python-pyserial python-matplotlib
 git clone https://github.com/sera5m/vulcan-ide
 cd vulcan-ide
-# first run clones vulcan-lang (the SDK / stdlib) if needed
 python3 vulcan_ide.py
 ```
 
-Linux packages: `gtk4 python-gobject python-pyserial python-matplotlib`
-
-See MODEL.md (Java/C# map). Language repo: https://github.com/sera5m/vulcan-lang
-Watch OS (interpreter built into firmware): https://github.com/sera5m/OIRIA_OS_espIDF
+- Folder / file list, Open, Save, Export
+- Line numbers; errors print `line N:`
+- Run: `rsvm` if on PATH, else `vulcan_run.py`
+- Language: include, C arrays, `@memory_hard`, `native` / `py`
