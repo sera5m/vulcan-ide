@@ -1,9 +1,9 @@
-# Module graph
+# What this repo is
 
-```
-vulcan-lang              BASE + desktop VM
-     |
-     +-- vulcan-ide      THIS REPO  (BASE + desktop VM)
-     |
-     `-- OIRIA watch VM  other repo, BASE only, not this IDE
-```
+Desktop product: **editor + virtual machine**, for Linux/Windows.
+
+Depends on **vulcan-lang BASE** (C++ parse/bytecode/rules).
+The VM is that backend. The IDE is how a person uses it.
+Same idea as a C# IDE on top of the CLR — not a second language.
+
+Does not implement a different Vulcan. Does not own the watch VM.
