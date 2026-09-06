@@ -13,10 +13,17 @@ import math
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 SIN_Q15 = [int(round(math.sin(2 * math.pi * i / 256) * 32767)) for i in range(256)]
 HARD_DIR = Path(os.environ.get("VULCAN_HARD", Path.cwd() / ".vulcan_hard"))
+
+# Desktop defaults — watch firmware uses RSVM_MAX_STEPS / HEAP_BYTES / threads=1
+DEFAULT_MAX_RUN = int(os.environ.get("VULCAN_MAX_RUN", "1000000"))
+DEFAULT_RAM_CELLS = int(os.environ.get("VULCAN_RAM_CELLS", "1000000"))
+DEFAULT_STORAGE = int(os.environ.get("VULCAN_STORAGE", str(64 * 1024 * 1024)))
+DEFAULT_THREADS = int(os.environ.get("VULCAN_THREADS", str(os.cpu_count() or 4)))
 
 
 def _phase_from_deg(deg: int) -> int:
@@ -161,6 +168,24 @@ class Runner:
         self.include_stack = []
         self.line = 1
         self.src = ""
+        self.steps = 0
+        self.max_run = DEFAULT_MAX_RUN
+        self.ram_cells = DEFAULT_RAM_CELLS
+        self.storage_bytes = DEFAULT_STORAGE
+        self.thread_cap = max(1, DEFAULT_THREADS)
+        self.parallel_n = 1
+        self.ram_used = 0
+        self.retval = None
+
+    def _tick(self, n=1):
+        self.steps += n
+        if self.steps > self.max_run:
+            raise RunError("max_run exceeded (%d)" % self.max_run, self.line)
+
+    def _ram_add(self, cells: int):
+        self.ram_used += cells
+        if self.ram_used > self.ram_cells:
+            raise RunError("ram limit exceeded (%d cells)" % self.ram_cells, self.line)
 
     def run(self, src: str, path: str | None = None) -> str:
         if path:
@@ -171,10 +196,26 @@ class Runner:
             src = preprocess(src)
         except Exception:
             pass
-        src = re.sub(r"set_\w+[^\n;]*;", "", src)
+        src = self._apply_vm_params(src)
         self.src = src
         self._exec_block(src, 0)
         return "".join(self.out)
+
+    def _apply_vm_params(self, src: str) -> str:
+        def grab(name, default_attr):
+            m = re.search(r"set_%s\s+(\d+)\s*;" % name, src)
+            if m:
+                setattr(self, default_attr, int(m.group(1)))
+                return re.sub(r"set_%s\s+\d+\s*;" % name, "", src)
+            return src
+
+        src = grab("max_run", "max_run")
+        src = grab("step_depth", "max_run")
+        src = grab("ram", "ram_cells")
+        src = grab("storage", "storage_bytes")
+        src = grab("threads", "thread_cap")
+        src = re.sub(r"set_(?!max_run|step_depth|ram|storage|threads)\w+[^\n;]*;", "", src)
+        return src
 
     def _includes(self, src: str, base: Path) -> str:
         def one(m):
@@ -201,6 +242,7 @@ class Runner:
             if i >= n:
                 break
             self.line = _line_at(self.src, origin + i) if self.src else _line_at(src, i)
+            self._tick()
             if src.startswith("fn ", i):
                 i = self._take_fn(src, i)
                 continue
@@ -248,18 +290,27 @@ class Runner:
         head = src[i : src.find("{", i)]
         m = re.search(r"fn\s+([A-Za-z_]\w*)", head)
         args = re.search(r"in\[([^\]]*)\]", head)
+        par = re.search(r"@parallel\s*\(\s*(\d+)\s*\)", head) or re.search(r"@parallel\b", head)
+        b = src.find("{", i)
+        if b < 0:
+            return self._skip_fn(src, i)
+        e, nxt = self._matching_brace(src, b)
         end = self._skip_fn(src, i)
         if not m:
             return end
         name = m.group(1)
         params = [p.strip() for p in args.group(1).split(",") if p.strip()] if args else []
-        body = src[src.find("{", i) + 1 : end]
+        body = src[b + 1 : e]
         expr = "0"
         for line in body.split(";"):
             line = line.strip()
             if line.startswith("return "):
                 expr = line[7:].strip()
-        self.env["__fn_" + name] = (params, expr, body)
+        pn = 1
+        if par:
+            pn = int(par.group(1)) if par.lastindex else min(self.thread_cap, 4)
+            pn = max(1, min(pn, self.thread_cap))
+        self.env["__fn_" + name] = (params, expr, body, pn)
         return end
 
     def _skip_fn(self, src, i):
@@ -295,8 +346,27 @@ class Runner:
         body_l = src.find("{", rb)
         body_r, nxt = self._matching_brace(src, body_l)
         body = src[body_l + 1 : body_r]
-        for _ in range(max(0, count)):
-            self._exec_block(body, 0)
+        workers = min(self.parallel_n, self.thread_cap)
+        if workers > 1 and count > 1:
+            def one(_i):
+                r = Runner(self.base)
+                r.env = dict(self.env)
+                r.max_run = self.max_run
+                r.ram_cells = self.ram_cells
+                r.storage_bytes = self.storage_bytes
+                r.thread_cap = 1
+                r.parallel_n = 1
+                r._exec_block(body, 0)
+                return r.out, r.steps
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = [ex.submit(one, i) for i in range(count)]
+                for f in as_completed(futs):
+                    out, st = f.result()
+                    self.out.extend(out)
+                    self._tick(st)
+        else:
+            for _ in range(max(0, count)):
+                self._exec_block(body, 0)
         return nxt
 
     def _matching_brace(self, src, l):
@@ -316,6 +386,8 @@ class Runner:
             self.out.append(str(self._eval(stmt[6:-1].strip())) + "\n")
             return
         if stmt.startswith("return"):
+            rest = stmt[6:].strip()
+            self.retval = self._eval(rest) if rest else 0
             return
         # a[i,j] = v
         m = re.match(r"([A-Za-z_]\w*)\[(.+)\]\s*=\s*(.*)$", stmt)
@@ -347,8 +419,12 @@ class Runner:
                 if data is not None:
                     arr.data = data
                     _hard_save(name, arr)
+                    used = sum(p.stat().st_size for p in HARD_DIR.glob("*.json")) if HARD_DIR.exists() else 0
+                    if used > self.storage_bytes:
+                        raise RunError("storage limit exceeded (%d bytes)" % self.storage_bytes, self.line)
             elif data is not None:
                 arr.data = data
+            self._ram_add(len(arr.data))
             self.env[name] = arr
             return
         m = re.match(r"arr_new\s*\((.+)\)\s*=\s*([A-Za-z_]\w*)$", stmt)
@@ -422,28 +498,38 @@ class Runner:
             return self.env[m.group(1)].get(idx)
         mcall = re.match(r"([A-Za-z_]\w*)\s+in\[(.*?)\](?:\s+out\[[^\]]*\])?\s*$", expr)
         if mcall and ("__fn_" + mcall.group(1)) in self.env:
-            params, body, _full = self._fn_parts(mcall.group(1))
+            params, body, _full, pn = self._fn_parts(mcall.group(1))
             raw_args = [a.strip() for a in mcall.group(2).split(",") if a.strip()]
             local = dict(self.env)
             for n, a in zip(params, raw_args):
                 local[n] = self._eval(a)
             saved, self.env = self.env, local
+            prev_p = self.parallel_n
+            self.parallel_n = pn
+            self.retval = None
             try:
-                return self._eval(body)
+                self._exec_block(_full or body, 0)
+                return self.retval if self.retval is not None else 0
             finally:
+                self.parallel_n = prev_p
                 self.env = saved
         # C-style fn()
         m = re.match(r"([A-Za-z_]\w*)\((.*)\)\s*$", expr)
         if m and ("__fn_" + m.group(1)) in self.env:
-            params, body, _ = self._fn_parts(m.group(1))
+            params, body, _full, pn = self._fn_parts(m.group(1))
             raw_args = [a.strip() for a in m.group(2).split(",") if a.strip()]
             local = dict(self.env)
             for n, a in zip(params, raw_args):
                 local[n] = self._eval(a)
             saved, self.env = self.env, local
+            prev_p = self.parallel_n
+            self.parallel_n = pn
+            self.retval = None
             try:
-                return self._eval(body)
+                self._exec_block(_full or body, 0)
+                return self.retval if self.retval is not None else 0
             finally:
+                self.parallel_n = prev_p
                 self.env = saved
         expr2 = re.sub(r"\bsin_amp\s*\(", " _sa(", expr)
         expr2 = re.sub(r"\bsin\s*\(", " _s(", expr2)
@@ -486,7 +572,9 @@ class Runner:
     def _fn_parts(self, name):
         v = self.env["__fn_" + name]
         if len(v) == 2:
-            return v[0], v[1], ""
+            return v[0], v[1], "", 1
+        if len(v) == 3:
+            return v[0], v[1], v[2], 1
         return v
 
 
