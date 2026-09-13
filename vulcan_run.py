@@ -13,6 +13,7 @@ import math
 import os
 import re
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -157,6 +158,49 @@ def _native_call(spec: str, *args):
         else:
             cargs.append(int(a))
     return f(*cargs)
+
+
+NSEQ_NIDS = {
+    "nop": 0,
+    "wave": 1,
+    "wave_stop": 2,
+    "wave_freq": 3,
+    "wave_duty": 4,
+    "wave_amp": 5,
+    "sweep": 6,
+    "adc": 7,
+    "scope": 8,
+    "delay": 9,
+    "sleep": 9,
+    "gpio_wr": 10,
+    "gpio_rd": 11,
+    "pin_mode": 12,
+    "dig_wr": 13,
+    "dig_rd": 14,
+    "corz": 15,
+    "siggen_start": 1,
+    "siggen_stop": 2,
+    "scope_mv": 7,
+}
+
+
+def _split_top(s: str, sep: str = ","):
+    parts, depth, cur = [], 0, []
+    for c in s:
+        if c in "([":
+            depth += 1
+            cur.append(c)
+        elif c in ")]":
+            depth -= 1
+            cur.append(c)
+        elif c == sep and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+    if cur:
+        parts.append("".join(cur).strip())
+    return [p for p in parts if p]
 
 
 class Runner:
@@ -489,6 +533,11 @@ class Runner:
         expr = expr.strip()
         if not expr:
             return 0
+        if expr.startswith("native_seq(") or expr.startswith("nseq("):
+            inner = expr[expr.find("(") + 1 :]
+            if inner.endswith(")"):
+                inner = inner[:-1]
+            return self._nseq(inner)
         if expr[0] == '"' and expr[-1] == '"':
             return expr[1:-1]
         # indexing
@@ -568,6 +617,68 @@ class Runner:
             raise
         except Exception as e:
             raise RunError("%s: %s" % (expr, e), self.line) from e
+
+    def _nseq(self, inner: str):
+        parts = _split_top(inner)
+        if not parts:
+            return 0
+        steps = []
+        packed = True
+        for part in parts:
+            m = re.match(
+                r'(?:native|ccall)\s*\(\s*"([^"]+)"\s*(?:,(.*))?\)$',
+                part.strip(),
+                re.S,
+            )
+            if m:
+                packed = False
+                nid = NSEQ_NIDS.get(m.group(1))
+                if nid is None:
+                    raise RunError("unknown nseq nid %s" % m.group(1), self.line)
+                args = []
+                if m.group(2):
+                    args = [
+                        int(self._eval(x.strip()))
+                        for x in _split_top(m.group(2))
+                        if x.strip()
+                    ]
+                steps.append((nid, args))
+                continue
+            m = re.match(r"(?:delay|delay_ms|sleep)\s*\((.*)\)$", part.strip())
+            if m:
+                packed = False
+                steps.append((9, [int(self._eval(m.group(1)))]))
+                continue
+            if packed and len(parts) == 1:
+                return self._nseq_packed(self._eval(part))
+            raise RunError("nseq step: %s" % part, self.line)
+        last = 0
+        for nid, args in steps:
+            last = self._nseq_host(nid, args)
+        return last
+
+    def _nseq_packed(self, val):
+        if isinstance(val, Arr):
+            data = [int(x or 0) for x in val.data]
+        elif isinstance(val, (list, tuple)):
+            data = [int(x or 0) for x in val]
+        else:
+            raise RunError("native_seq wants packed i32 array", self.line)
+        last = 0
+        for i in range(0, len(data) - 6, 7):
+            nid = data[i]
+            na = max(0, min(5, data[i + 1]))
+            args = data[i + 2 : i + 2 + na]
+            last = self._nseq_host(nid, args)
+        return last
+
+    def _nseq_host(self, nid, args):
+        if nid == 9:
+            ms = int(args[0]) if args else 0
+            if ms > 0:
+                time.sleep(min(ms, 5000) / 1000.0)
+            return 0
+        return 0
 
     def _fn_parts(self, name):
         v = self.env["__fn_" + name]
